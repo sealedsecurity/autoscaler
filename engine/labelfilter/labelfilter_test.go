@@ -355,9 +355,11 @@ func TestParityVersionPin(t *testing.T) {
 	data, err := os.ReadFile(goModPath)
 	require.NoError(t, err, "reading %s", goModPath)
 
-	// Match the require line, tolerating both the single-line and require-block
-	// forms and an optional trailing `// indirect` comment.
-	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(modPath) + `\s+(v\S+)`)
+	// Match the require line, tolerating both the single-line form
+	// (`require <mod> <ver>`) and the require-block form (indented `<mod>
+	// <ver>`), with an optional trailing `// indirect` comment. The optional
+	// `require` keyword prefix covers the single-line declaration.
+	re := regexp.MustCompile(`(?m)^\s*(?:require\s+)?` + regexp.QuoteMeta(modPath) + `\s+(v\S+)`)
 	m := re.FindSubmatch(data)
 	require.NotNil(t, m, "%s not found in %s; parity pin cannot be verified", modPath, goModPath)
 	pinned := string(m[1])
