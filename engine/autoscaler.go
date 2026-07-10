@@ -10,17 +10,30 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"go.woodpecker-ci.org/autoscaler/config"
+	"go.woodpecker-ci.org/autoscaler/engine/labelfilter"
 	"go.woodpecker-ci.org/autoscaler/engine/types"
 	"go.woodpecker-ci.org/autoscaler/server"
 	"go.woodpecker-ci.org/autoscaler/utils"
 	"go.woodpecker-ci.org/woodpecker/v3/woodpecker-go/woodpecker"
 )
 
+// agentListPageSize is the server's maxPageSize for /api/agents
+// (server/router/middleware/session/pagination.go). woodpecker-go's AgentList()
+// fetches only the first page; loadAgents warns if the fleet reaches this size,
+// since the netting step would then under-count non-pool capacity.
+const agentListPageSize = 50
+
 type Autoscaler struct {
-	client   server.Client
-	agents   []*woodpecker.Agent
-	config   *config.Config
-	provider types.Provider
+	client server.Client
+	// agents holds only this pool's agents (name matches the PoolID regex),
+	// populated by loadAgents.
+	agents []*woodpecker.Agent
+	// allAgents holds every agent the server returned this reconcile, used by
+	// the shared-demand netting step to see free capacity on non-pool (static)
+	// agents. Also populated by loadAgents.
+	allAgents []*woodpecker.Agent
+	config    *config.Config
+	provider  types.Provider
 }
 
 // NewAutoscaler creates a new Autoscaler instance.
@@ -63,6 +76,20 @@ func (a *Autoscaler) loadAgents(_ context.Context) error {
 	if err != nil {
 		return fmt.Errorf("client.AgentList: %w", err)
 	}
+
+	// The server paginates /api/agents at maxPageSize=50 and the woodpecker-go
+	// AgentList() fetches only the first page. The shared-demand netting in
+	// calcAgents needs to see free capacity on non-pool agents, so a truncated
+	// list would under-count static capacity and over-provision the pool
+	// (bounded by MaxAgents, so it errs to burst-relief, never to starvation).
+	// The real fleet is a handful of agents; warn loudly if it ever approaches
+	// the page limit so this is caught before it silently degrades.
+	if len(agents) >= agentListPageSize {
+		log.Warn().Int("agents", len(agents)).Int("page_size", agentListPageSize).
+			Msg("agent list hit the server page size; shared-demand netting may under-count non-pool capacity and over-provision (bounded by MaxAgents)")
+	}
+	a.allAgents = agents
+
 	r, err := regexp.Compile(fmt.Sprintf("pool-%s-agent-.*?", a.config.PoolID))
 	if err != nil {
 		return fmt.Errorf("could not create regex matcher for agent names by pool ID: %w", err)
@@ -338,34 +365,118 @@ func (a *Autoscaler) cleanupStaleAgents(ctx context.Context) error {
 	return nil
 }
 
-func (a *Autoscaler) getQueueInfo(_ context.Context) (freeTasks, runningTasks, pendingTasks int, err error) {
+func (a *Autoscaler) getQueueInfo(_ context.Context) (*woodpecker.Info, error) {
 	queueInfo, err := a.client.QueueInfo()
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("error from QueueInfo: %s", err.Error())
+		return nil, fmt.Errorf("error from QueueInfo: %s", err.Error())
+	}
+	return queueInfo, nil
+}
+
+// poolAgentIDs returns the set of agent IDs belonging to this pool.
+func (a *Autoscaler) poolAgentIDs() map[int64]struct{} {
+	ids := make(map[int64]struct{}, len(a.agents))
+	for _, agent := range a.agents {
+		ids[agent.ID] = struct{}{}
+	}
+	return ids
+}
+
+// countPoolRunning counts running tasks assigned to this pool's agents, using
+// the exact AgentID→pool assignment rather than label inference.
+func (a *Autoscaler) countPoolRunning(running []woodpecker.Task) int {
+	poolIDs := a.poolAgentIDs()
+	n := 0
+	for _, task := range running {
+		if _, ok := poolIDs[task.AgentID]; ok {
+			n++
+		}
+	}
+	return n
+}
+
+// freeStaticSlots models the currently-free capacity on each non-pool agent as
+// a per-agent filter + remaining-slot count. Slots are Agent.Capacity minus the
+// running tasks already assigned to that agent. Pool agents are excluded — the
+// netting step only credits demand that capacity *outside* this pool can absorb.
+type freeStaticSlots struct {
+	filter labelfilter.PoolFilter
+	free   int
+}
+
+func (a *Autoscaler) nonPoolFreeSlots(running []woodpecker.Task) []*freeStaticSlots {
+	poolIDs := a.poolAgentIDs()
+
+	assigned := make(map[int64]int)
+	for _, task := range running {
+		assigned[task.AgentID]++
 	}
 
-	return queueInfo.Stats.Workers, queueInfo.Stats.Running, queueInfo.Stats.Pending, nil
+	slots := make([]*freeStaticSlots, 0, len(a.allAgents))
+	for _, agent := range a.allAgents {
+		if _, ok := poolIDs[agent.ID]; ok {
+			continue // pool agent — not "other" capacity
+		}
+		if agent.NoSchedule {
+			continue // draining/quarantined — cannot take new work
+		}
+		free := int(agent.Capacity) - assigned[agent.ID]
+		if free <= 0 {
+			continue
+		}
+		slots = append(slots, &freeStaticSlots{filter: labelfilter.AgentFilter(agent), free: free})
+	}
+	return slots
 }
 
 func (a *Autoscaler) calcAgents(ctx context.Context) (float64, error) {
-	freeTasks, runningTasks, pendingTasks, err := a.getQueueInfo(ctx)
+	queueInfo, err := a.getQueueInfo(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	log.Debug().Msgf("queue info: freeTasks = %v runningTasks = %v pendingTasks = %v", freeTasks, runningTasks, pendingTasks)
-	availableAgents := math.Ceil(float64(freeTasks+runningTasks) / float64(a.config.WorkflowsPerAgent))
-	reqAgents := math.Ceil(float64(pendingTasks+runningTasks) / float64(a.config.WorkflowsPerAgent))
+	poolFilter := labelfilter.NewPoolFilter(a.config.ExtraAgentLabels)
+	staticSlots := a.nonPoolFreeSlots(queueInfo.Running)
+
+	eligiblePending := 0
+	nettedOut := 0
+	for _, task := range queueInfo.Pending {
+		if !poolFilter.Satisfiable(task) {
+			continue // pool can't run it — the label-blind waste this fixes
+		}
+		// Net out a free non-pool slot that can also run this shared-eligible
+		// task (greedy, first fit, in queue order).
+		absorbed := false
+		for _, slot := range staticSlots {
+			if slot.free > 0 && slot.filter.Satisfiable(task) {
+				slot.free--
+				nettedOut++
+				absorbed = true
+				break
+			}
+		}
+		if !absorbed {
+			eligiblePending++
+		}
+	}
+
+	poolRunning := a.countPoolRunning(queueInfo.Running)
+
+	log.Debug().Msgf("queue info (pool %s): eligiblePending = %d netted = %d poolRunning = %d",
+		a.config.PoolID, eligiblePending, nettedOut, poolRunning)
+
+	required := math.Ceil(float64(eligiblePending+poolRunning) / float64(a.config.WorkflowsPerAgent))
 
 	availablePoolAgents := len(a.getPoolAgents(true))
 	maxUp := float64(a.config.MaxAgents - availablePoolAgents)
 	maxDown := float64(availablePoolAgents - a.config.MinAgents)
 
-	reqPoolAgents := math.Ceil(reqAgents - (availableAgents + float64(availablePoolAgents)))
+	reqPoolAgents := required - float64(availablePoolAgents)
 	reqPoolAgents = math.Max(reqPoolAgents, -maxDown)
 	reqPoolAgents = math.Min(reqPoolAgents, maxUp)
 
-	log.Debug().Msgf("capacity info: agents = %v/%v pool = %v/%v limits = %v/%v", availableAgents, reqAgents, availablePoolAgents, reqPoolAgents, maxUp, maxDown)
+	log.Debug().Msgf("capacity info (pool %s): required = %v pool = %v/%v limits = %v/%v",
+		a.config.PoolID, required, availablePoolAgents, reqPoolAgents, maxUp, maxDown)
 
 	return reqPoolAgents, nil
 }
