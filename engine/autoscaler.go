@@ -368,7 +368,7 @@ func (a *Autoscaler) cleanupStaleAgents(ctx context.Context) error {
 func (a *Autoscaler) getQueueInfo(_ context.Context) (*woodpecker.Info, error) {
 	queueInfo, err := a.client.QueueInfo()
 	if err != nil {
-		return nil, fmt.Errorf("error from QueueInfo: %s", err.Error())
+		return nil, fmt.Errorf("client.QueueInfo: %w", err)
 	}
 	return queueInfo, nil
 }

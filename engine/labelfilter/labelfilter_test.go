@@ -15,9 +15,14 @@
 package labelfilter
 
 import (
+	"os"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.woodpecker-ci.org/woodpecker/v3/pipeline"
 	"go.woodpecker-ci.org/woodpecker/v3/woodpecker-go/woodpecker"
@@ -326,4 +331,39 @@ func TestAgentFilter(t *testing.T) {
 		assert.True(t, f.Satisfiable(woodpecker.Task{Labels: map[string]string{"type": "linux", "org-id": "7"}}))
 		assert.False(t, f.Satisfiable(woodpecker.Task{Labels: map[string]string{"type": "linux", "org-id": "8"}}))
 	})
+}
+
+// TestParityVersionPin is a tripwire on the manual parity invariant. The match
+// logic in labelfilter.go is a verbatim transliteration of the scheduler's
+// unexported createFilterFunc / requiredLabelsMissing (server/scheduler/
+// filter.go), so it cannot be defended by a live import-and-diff. Instead this
+// asserts that the pinned go.woodpecker-ci.org/woodpecker/v3 module version
+// still equals transliteratedFromVersion. When a dependency bump changes the
+// pinned version, this fails — forcing a re-read of the upstream filter and,
+// if it still matches, a bump of the const. It converts a silent drift (which
+// over- or under-scales the pool) into a loud, actionable test failure.
+func TestParityVersionPin(t *testing.T) {
+	const modPath = "go.woodpecker-ci.org/woodpecker/v3"
+
+	// Locate go.mod relative to this source file (robust to the test's CWD):
+	// this file is engine/labelfilter/labelfilter_test.go, so go.mod is two
+	// directories up.
+	_, thisFile, _, ok := runtime.Caller(0)
+	require.True(t, ok, "runtime.Caller(0) failed; cannot locate go.mod")
+	goModPath := filepath.Join(filepath.Dir(thisFile), "..", "..", "go.mod")
+
+	data, err := os.ReadFile(goModPath)
+	require.NoError(t, err, "reading %s", goModPath)
+
+	// Match the require line, tolerating both the single-line and require-block
+	// forms and an optional trailing `// indirect` comment.
+	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(modPath) + `\s+(v\S+)`)
+	m := re.FindSubmatch(data)
+	require.NotNil(t, m, "%s not found in %s; parity pin cannot be verified", modPath, goModPath)
+	pinned := string(m[1])
+
+	assert.Equal(t, transliteratedFromVersion, pinned,
+		"pinned %s version drifted from the version the label filter was transliterated from; "+
+			"re-read server/scheduler/filter.go against matchFilter/requiredLabelsMissing, "+
+			"then update transliteratedFromVersion in labelfilter.go", modPath)
 }

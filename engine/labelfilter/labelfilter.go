@@ -39,6 +39,16 @@ import (
 // never needs, and this is a single stable sentinel.
 const idNotSet int64 = -1
 
+// transliteratedFromVersion is the exact go.woodpecker-ci.org/woodpecker/v3
+// module version whose server/scheduler/filter.go the match logic below was
+// transliterated from. The parity is a manual invariant: matchFilter /
+// requiredLabelsMissing mirror the scheduler's unexported createFilterFunc /
+// requiredLabelsMissing, which cannot be imported for a live diff. The
+// TestParityVersionPin tripwire fails when the pinned module version drifts
+// from this const, forcing a re-read of the upstream filter (and a bump of
+// this const) on every dependency update — see labelfilter_test.go.
+const transliteratedFromVersion = "v3.16.0"
+
 // PoolFilter is the effective label set an agent pool advertises to the
 // scheduler: the pool's configured labels plus the server/agent-stamped
 // defaults (repo="*", org-id="*") that apply to every agent. A task is
