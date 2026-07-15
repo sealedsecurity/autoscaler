@@ -49,11 +49,12 @@ const idNotSet int64 = -1
 // this const) on every dependency update — see labelfilter_test.go.
 const transliteratedFromVersion = "v3.16.0"
 
-// PoolFilter is the effective label set an agent pool advertises to the
-// scheduler: the pool's configured labels plus the server/agent-stamped
-// defaults (repo="*", org-id="*") that apply to every agent. A task is
-// runnable on the pool iff Satisfiable reports true.
-type PoolFilter struct {
+// Filter is the effective label set an agent advertises to the scheduler: its
+// configured/custom labels plus the server/agent-stamped defaults (repo="*",
+// org-id="*") that apply to every agent. A task is runnable on the agent iff
+// Satisfiable reports true. Built by NewPoolFilter (for the managed elastic
+// pool) or AgentFilter (for an existing static agent).
+type Filter struct {
 	labels map[string]string
 }
 
@@ -72,14 +73,14 @@ type PoolFilter struct {
 // A custom label of the same key overrides the default (agent.go applies
 // customLabels last via maps.Copy); org-id is server-enforced, so it is applied
 // after the customs and always wins for the pool's system agents.
-func NewPoolFilter(extra map[string]string) PoolFilter {
+func NewPoolFilter(extra map[string]string) Filter {
 	labels := make(map[string]string, len(extra)+2)
 	labels[pipeline.LabelFilterRepo] = "*"
 	maps.Copy(labels, extra)
 	// org-id is enforced by the server for system (autoscaler-created) agents,
 	// so it is applied last and is not overridable by ExtraAgentLabels.
 	labels[pipeline.LabelFilterOrg] = "*"
-	return PoolFilter{labels: labels}
+	return Filter{labels: labels}
 }
 
 // AgentFilter builds the modeled filter for an existing agent (used by the
@@ -88,7 +89,7 @@ func NewPoolFilter(extra map[string]string) PoolFilter {
 //   - repo="*" default under the agent's CustomLabels;
 //   - org-id from the server ownership rule (server/model/agent.go
 //     GetServerLabels): OrgID unset (== idNotSet, -1) ⇒ "*", else the id.
-func AgentFilter(a *woodpecker.Agent) PoolFilter {
+func AgentFilter(a *woodpecker.Agent) Filter {
 	labels := make(map[string]string, len(a.CustomLabels)+2)
 	labels[pipeline.LabelFilterRepo] = "*"
 	maps.Copy(labels, a.CustomLabels)
@@ -97,12 +98,12 @@ func AgentFilter(a *woodpecker.Agent) PoolFilter {
 	} else {
 		labels[pipeline.LabelFilterOrg] = "*"
 	}
-	return PoolFilter{labels: labels}
+	return Filter{labels: labels}
 }
 
 // Satisfiable reports whether a task can run on an agent advertising this
 // filter — the scheduler's own verdict, discarding the score.
-func (f PoolFilter) Satisfiable(t woodpecker.Task) bool {
+func (f Filter) Satisfiable(t woodpecker.Task) bool {
 	matched, _ := matchFilter(f.labels, t.Labels)
 	return matched
 }

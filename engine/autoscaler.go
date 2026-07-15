@@ -373,19 +373,32 @@ func (a *Autoscaler) getQueueInfo(_ context.Context) (*woodpecker.Info, error) {
 	return queueInfo, nil
 }
 
-// poolAgentIDs returns the set of agent IDs belonging to this pool.
-func (a *Autoscaler) poolAgentIDs() map[int64]struct{} {
+// poolAgentIDs returns the set of agent IDs belonging to this pool. When
+// excludeNoSchedule is true, draining (NoSchedule) agents are omitted, keeping
+// the set symmetric with getPoolAgents(true) (the available-capacity offset).
+// When false, every pool agent is included — nonPoolFreeSlots uses that to
+// exclude the whole pool from "other/static" capacity, so a draining pool agent
+// is never miscounted as static capacity.
+func (a *Autoscaler) poolAgentIDs(excludeNoSchedule bool) map[int64]struct{} {
 	ids := make(map[int64]struct{}, len(a.agents))
 	for _, agent := range a.agents {
+		if excludeNoSchedule && agent.NoSchedule {
+			continue
+		}
 		ids[agent.ID] = struct{}{}
 	}
 	return ids
 }
 
-// countPoolRunning counts running tasks assigned to this pool's agents, using
-// the exact AgentID→pool assignment rather than label inference.
+// countPoolRunning counts running tasks assigned to this pool's schedulable
+// agents, using the exact AgentID→pool assignment rather than label inference.
+// Draining (NoSchedule) pool agents are excluded so an in-flight last task is
+// counted as neither demand (here) nor capacity (availablePoolAgents excludes
+// them too). Otherwise a draining agent finishing its last task inflates
+// required by 1, and createAgents reactivates the very agent being drained —
+// defeating scale-down for the whole drain window.
 func (a *Autoscaler) countPoolRunning(running []woodpecker.Task) int {
-	poolIDs := a.poolAgentIDs()
+	poolIDs := a.poolAgentIDs(true)
 	n := 0
 	for _, task := range running {
 		if _, ok := poolIDs[task.AgentID]; ok {
@@ -400,12 +413,14 @@ func (a *Autoscaler) countPoolRunning(running []woodpecker.Task) int {
 // running tasks already assigned to that agent. Pool agents are excluded — the
 // netting step only credits demand that capacity *outside* this pool can absorb.
 type freeStaticSlots struct {
-	filter labelfilter.PoolFilter
+	filter labelfilter.Filter
 	free   int
 }
 
 func (a *Autoscaler) nonPoolFreeSlots(running []woodpecker.Task) []*freeStaticSlots {
-	poolIDs := a.poolAgentIDs()
+	// false: a draining pool agent is still a pool agent — exclude the whole
+	// pool from "other/static" capacity, never count it as a static slot.
+	poolIDs := a.poolAgentIDs(false)
 
 	assigned := make(map[int64]int)
 	for _, task := range running {
@@ -446,6 +461,16 @@ func (a *Autoscaler) calcAgents(ctx context.Context) (float64, error) {
 		}
 		// Net out a free non-pool slot that can also run this shared-eligible
 		// task (greedy, first fit, in queue order).
+		//
+		// This is a first-fit approximation of maximum bipartite matching
+		// (tasks ↔ static slots). It can under-net when an early task greedily
+		// takes a broad-filter slot that a later, more-constrained task also
+		// needed — over-provisioning the pool by up to the number of such
+		// order-dependent collisions. The error is always in the safe
+		// direction (extra burst capacity, never starvation), bounded by
+		// MaxAgents, and self-corrects on the next reconcile. Static agents are
+		// few and mostly homogeneous, so exact matching (most-constrained-first
+		// ordering, or Hopcroft–Karp) is not worth the complexity here.
 		absorbed := false
 		for _, slot := range staticSlots {
 			if slot.free > 0 && slot.filter.Satisfiable(task) {

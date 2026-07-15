@@ -234,6 +234,142 @@ func Test_calcAgents(t *testing.T) {
 		value, _ := autoscaler.calcAgents(t.Context())
 		assert.Equal(t, float64(1), value, "macOS static can't run linux ⇒ not netted")
 	})
+
+	t.Run("draining pool agent finishing its last task ⇒ no scale-up (M1)", func(t *testing.T) {
+		// A NoSchedule (draining) pool agent is running its final task with an
+		// empty queue. The in-flight task must count as neither demand nor
+		// capacity: it is on an agent we're tearing down, so re-justifying that
+		// agent would defeat the whole drain window.
+		autoscaler := Autoscaler{
+			client: &MockClient{
+				running: []woodpecker.Task{{AgentID: 10, Labels: map[string]string{"type": "linux"}}},
+			},
+			agents:    []*woodpecker.Agent{{ID: 10, Name: "pool-1-agent-a", NoSchedule: true}},
+			allAgents: []*woodpecker.Agent{{ID: 10, Name: "pool-1-agent-a", NoSchedule: true}},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				MinAgents:         0,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(0), value, "draining pool agent's last task must not re-justify the agent (M1)")
+	})
+
+	t.Run("mixed drain+schedulable pool scales down by the schedulable count (M1b)", func(t *testing.T) {
+		// Empty queue ⇒ required=0. Only the schedulable agent counts as an
+		// available pool agent (the draining NoSchedule one is excluded via
+		// getPoolAgents(true)) = 1, so reqPoolAgents = 0 - 1 = -1, clamped by
+		// maxDown = 1-0 = 1 ⇒ -1. This pins the symmetric scale-DOWN side of M1:
+		// if a refactor let the draining agent into availablePoolAgents (=2) the
+		// result would be -2 — draining 2 when only 1 is schedulable.
+		autoscaler := Autoscaler{
+			client: &MockClient{},
+			agents: []*woodpecker.Agent{
+				{ID: 10, Name: "pool-1-agent-a"},
+				{ID: 11, Name: "pool-1-agent-b", NoSchedule: true},
+			},
+			allAgents: []*woodpecker.Agent{
+				{ID: 10, Name: "pool-1-agent-a"},
+				{ID: 11, Name: "pool-1-agent-b", NoSchedule: true},
+			},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				MinAgents:         0,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(-1), value, "draining agent excluded from availablePoolAgents; only the 1 schedulable idle agent drives scale-down (M1b)")
+	})
+
+	t.Run("free NoSchedule static agent does not net a task (M3a)", func(t *testing.T) {
+		// A quarantined (NoSchedule) static agent has nominal free capacity but
+		// cannot take new work, so it must not absorb the pending linux task —
+		// the pool still has to scale.
+		staticAgent := &woodpecker.Agent{
+			ID: 99, Name: "mattserver", OrgID: -1, Capacity: 1, NoSchedule: true,
+			CustomLabels: map[string]string{"type": "linux"},
+		}
+		autoscaler := Autoscaler{
+			client:    &MockClient{pending: []woodpecker.Task{linuxTask()}},
+			allAgents: []*woodpecker.Agent{staticAgent},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(1), value, "a quarantined (NoSchedule) static agent cannot absorb work")
+	})
+
+	t.Run("Capacity:2 idle static absorbs two pending linux tasks (M3b)", func(t *testing.T) {
+		// One idle static agent with two free slots nets out both eligible
+		// pending tasks ⇒ the pool does not scale.
+		staticAgent := &woodpecker.Agent{
+			ID: 99, Name: "mattserver", OrgID: -1, Capacity: 2,
+			CustomLabels: map[string]string{"type": "linux"},
+		}
+		autoscaler := Autoscaler{
+			client:    &MockClient{pending: []woodpecker.Task{linuxTask(), linuxTask()}},
+			allAgents: []*woodpecker.Agent{staticAgent},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(0), value, "a capacity-2 idle static agent absorbs both pending linux tasks")
+	})
+
+	t.Run("greedy first-fit over-provisions in adversarial order (M3c)", func(t *testing.T) {
+		// PINS the documented greedy first-fit netting approximation (see the
+		// maximum-bipartite-matching comment in calcAgents) — this is the
+		// accepted safe-direction over-provisioning, NOT a bug to fix here.
+		//
+		// broad (OrgID:-1 ⇒ org-id:*) matches org 1 and org 2; narrow (OrgID:1
+		// ⇒ org-id:1) matches org 1 only. allAgents order matters:
+		// nonPoolFreeSlots iterates allAgents, so broad is tried first. The
+		// org-1 task greedily consumes the broad slot, leaving only the
+		// org-1-scoped narrow slot for the org-2 task — which it can't use — so
+		// the pool over-provisions by 1. An optimal matcher would send org-1 to
+		// narrow and net both to 0; changing that is a deliberate behavior
+		// change a future reader should review, and would flip this to 0.
+		broad := &woodpecker.Agent{
+			ID: 1, Name: "broadstatic", OrgID: -1, Capacity: 1,
+			CustomLabels: map[string]string{"type": "linux"},
+		}
+		narrow := &woodpecker.Agent{
+			ID: 2, Name: "narrowstatic", OrgID: 1, Capacity: 1,
+			CustomLabels: map[string]string{"type": "linux"},
+		}
+		taskOrg2 := woodpecker.Task{Labels: map[string]string{"type": "linux", "repo": "sealed/x", "org-id": "2"}}
+		autoscaler := Autoscaler{
+			client:    &MockClient{pending: []woodpecker.Task{linuxTask() /* org-id 1 */, taskOrg2}},
+			allAgents: []*woodpecker.Agent{broad, narrow}, // ORDER MATTERS: broad tried first
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(1), value, "greedy first-fit: linux(org1) takes the broad slot, org2 can't use the org1-scoped narrow slot ⇒ over-provisions by 1 (accepted safe-direction approx; see calcAgents netting comment)")
+	})
 }
 
 func Test_getQueueInfo(t *testing.T) {
