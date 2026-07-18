@@ -15,122 +15,242 @@ import (
 	"go.woodpecker-ci.org/woodpecker/v3/woodpecker-go/woodpecker"
 )
 
+// MockClient serves a configurable queue Info (pending/running task lists with
+// labels) for the label-aware calcAgents tests. It embeds woodpecker.Client so
+// only QueueInfo needs an implementation.
 type MockClient struct {
-	workers       int
-	running       int
-	pending       int
-	waitingOnDeps int
+	pending []woodpecker.Task
+	running []woodpecker.Task
 	woodpecker.Client
 }
 
 func (m MockClient) QueueInfo() (*woodpecker.Info, error) {
-	info := &woodpecker.Info{}
+	return &woodpecker.Info{
+		Pending: m.pending,
+		Running: m.running,
+	}, nil
+}
 
-	info.Stats.Workers = m.workers
-	info.Stats.Running = m.running
-	info.Stats.Pending = m.pending
-	info.Stats.WaitingOnDeps = m.waitingOnDeps
+// linuxTask / heavyTask / macTask build tasks in the parent's routing
+// vocabulary, with the server-stamped repo/org-id every real queued task
+// carries (the labels the modeled pool filter must survive).
+func linuxTask() woodpecker.Task {
+	return woodpecker.Task{Labels: map[string]string{"type": "linux", "repo": "sealed/x", "org-id": "1"}}
+}
 
-	info.Pending = []woodpecker.Task{
-		{
-			Labels: map[string]string{
-				"arch": "amd64",
-			},
-		},
-	}
-	info.Running = []woodpecker.Task{
-		{
-			Labels: map[string]string{
-				"arch": "amd64",
-			},
-		},
-	}
+func heavyTask() woodpecker.Task {
+	return woodpecker.Task{Labels: map[string]string{"type": "linux", "size": "large", "repo": "sealed/x", "org-id": "1"}}
+}
 
-	return info, nil
+func macTask() woodpecker.Task {
+	return woodpecker.Task{Labels: map[string]string{"type": "macos", "repo": "sealed/x", "org-id": "1"}}
+}
+
+// elasticLabels is the pool's WOODPECKER_AGENT_LABELS in the parent's model.
+func elasticLabels() map[string]string {
+	return map[string]string{"type": "linux", "pool": "elastic"}
 }
 
 func Test_calcAgents(t *testing.T) {
 	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
 
-	t.Run("should create new agent (MinAgents)", func(t *testing.T) {
+	t.Run("all size=large pending ⇒ no scale-up (the headline waste case)", func(t *testing.T) {
 		autoscaler := Autoscaler{client: &MockClient{
-			pending: 0,
+			pending: []woodpecker.Task{heavyTask(), heavyTask(), heavyTask()},
 		}, config: &config.Config{
 			WorkflowsPerAgent: 1,
-			MaxAgents:         2,
-			MinAgents:         1,
+			MaxAgents:         8,
+			MinAgents:         0,
+			ExtraAgentLabels:  elasticLabels(),
 		}}
 
-		value, _ := autoscaler.calcAgents(t.Context())
-		assert.Equal(t, float64(1), value)
+		value, err := autoscaler.calcAgents(t.Context())
+		assert.NoError(t, err)
+		assert.Equal(t, float64(0), value, "heavy jobs the pool can't run must not scale it up")
 	})
 
-	t.Run("should create single agent", func(t *testing.T) {
+	t.Run("macOS pending ⇒ ignored", func(t *testing.T) {
 		autoscaler := Autoscaler{client: &MockClient{
-			pending: 2,
-		}, config: &config.Config{
-			WorkflowsPerAgent: 5,
-			MaxAgents:         3,
-		}}
-
-		value, _ := autoscaler.calcAgents(t.Context())
-		assert.Equal(t, float64(1), value)
-	})
-
-	t.Run("should create multiple agents", func(t *testing.T) {
-		autoscaler := Autoscaler{client: &MockClient{
-			pending: 6,
-		}, config: &config.Config{
-			WorkflowsPerAgent: 5,
-			MaxAgents:         3,
-		}}
-
-		value, _ := autoscaler.calcAgents(t.Context())
-		assert.Equal(t, float64(2), value)
-	})
-
-	t.Run("should create new agent (MaxAgents)", func(t *testing.T) {
-		autoscaler := Autoscaler{client: &MockClient{
-			pending: 2,
+			pending: []woodpecker.Task{macTask(), macTask()},
 		}, config: &config.Config{
 			WorkflowsPerAgent: 1,
-			MaxAgents:         2,
-		}, agents: []*woodpecker.Agent{
-			{Name: "pool-1-agent-1234"},
-		}}
-
-		value, _ := autoscaler.calcAgents(t.Context())
-		assert.Equal(t, float64(1), value)
-	})
-
-	t.Run("should not create new agent (availableAgents)", func(t *testing.T) {
-		autoscaler := Autoscaler{client: &MockClient{
-			workers: 2,
-			pending: 2,
-		}, config: &config.Config{
-			WorkflowsPerAgent: 1,
-			MaxAgents:         2,
+			MaxAgents:         8,
+			ExtraAgentLabels:  elasticLabels(),
 		}}
 
 		value, _ := autoscaler.calcAgents(t.Context())
 		assert.Equal(t, float64(0), value)
 	})
+
+	t.Run("bare linux pending ⇒ scales for eligible count", func(t *testing.T) {
+		autoscaler := Autoscaler{client: &MockClient{
+			pending: []woodpecker.Task{linuxTask(), linuxTask(), linuxTask()},
+		}, config: &config.Config{
+			WorkflowsPerAgent: 1,
+			MaxAgents:         8,
+			ExtraAgentLabels:  elasticLabels(),
+		}}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(3), value)
+	})
+
+	t.Run("mixed queue ⇒ scales only for the eligible (linux) count", func(t *testing.T) {
+		autoscaler := Autoscaler{client: &MockClient{
+			pending: []woodpecker.Task{heavyTask(), linuxTask(), macTask(), linuxTask(), heavyTask()},
+		}, config: &config.Config{
+			WorkflowsPerAgent: 1,
+			MaxAgents:         8,
+			ExtraAgentLabels:  elasticLabels(),
+		}}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(2), value, "only the two bare-linux tasks are eligible")
+	})
+
+	t.Run("WorkflowsPerAgent packs multiple eligible tasks per agent", func(t *testing.T) {
+		autoscaler := Autoscaler{client: &MockClient{
+			pending: []woodpecker.Task{linuxTask(), linuxTask(), linuxTask(), linuxTask(), linuxTask(), linuxTask()},
+		}, config: &config.Config{
+			WorkflowsPerAgent: 5,
+			MaxAgents:         8,
+			ExtraAgentLabels:  elasticLabels(),
+		}}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(2), value, "ceil(6/5) = 2")
+	})
+
+	t.Run("MaxAgents clamps scale-up", func(t *testing.T) {
+		autoscaler := Autoscaler{client: &MockClient{
+			pending: []woodpecker.Task{linuxTask(), linuxTask(), linuxTask(), linuxTask()},
+		}, config: &config.Config{
+			WorkflowsPerAgent: 1,
+			MaxAgents:         2,
+			ExtraAgentLabels:  elasticLabels(),
+		}}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(2), value, "4 eligible clamped to MaxAgents=2")
+	})
+
+	t.Run("MinAgents floor forces scale-up on an empty queue", func(t *testing.T) {
+		autoscaler := Autoscaler{client: &MockClient{}, config: &config.Config{
+			WorkflowsPerAgent: 1,
+			MaxAgents:         2,
+			MinAgents:         1,
+			ExtraAgentLabels:  elasticLabels(),
+		}}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(1), value, "empty queue but MinAgents=1 ⇒ +1")
+	})
+
+	t.Run("pool running tasks count toward required (no redundant scale-up)", func(t *testing.T) {
+		// one pool agent already running one eligible task; queue empty ⇒ pool
+		// is exactly staffed, delta 0.
+		autoscaler := Autoscaler{
+			client: &MockClient{
+				running: []woodpecker.Task{{AgentID: 10, Labels: map[string]string{"type": "linux"}}},
+			},
+			agents:    []*woodpecker.Agent{{ID: 10, Name: "pool-1-agent-a"}},
+			allAgents: []*woodpecker.Agent{{ID: 10, Name: "pool-1-agent-a"}},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(0), value, "required=1, one pool agent present ⇒ delta 0")
+	})
+
+	t.Run("shared-eligible pending netted out by a free static slot", func(t *testing.T) {
+		// A free static agent (large, capacity 1, idle) can absorb the one
+		// bare-linux pending task ⇒ pool does not scale.
+		staticAgent := &woodpecker.Agent{
+			ID: 99, Name: "mattserver", OrgID: -1, Capacity: 1,
+			CustomLabels: map[string]string{"type": "linux", "size": "large"},
+		}
+		autoscaler := Autoscaler{
+			client:    &MockClient{pending: []woodpecker.Task{linuxTask()}},
+			allAgents: []*woodpecker.Agent{staticAgent},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(0), value, "the free static slot absorbs the shared-eligible task")
+	})
+
+	t.Run("shared-eligible pending counted when static slot is busy", func(t *testing.T) {
+		// Same static agent, but its one slot is already running a task ⇒ no
+		// free capacity to net, so the pool scales for the pending linux task.
+		staticAgent := &woodpecker.Agent{
+			ID: 99, Name: "mattserver", OrgID: -1, Capacity: 1,
+			CustomLabels: map[string]string{"type": "linux", "size": "large"},
+		}
+		autoscaler := Autoscaler{
+			client: &MockClient{
+				pending: []woodpecker.Task{linuxTask()},
+				running: []woodpecker.Task{{AgentID: 99, Labels: map[string]string{"type": "linux", "size": "large"}}},
+			},
+			allAgents: []*woodpecker.Agent{staticAgent},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(1), value, "busy static can't absorb ⇒ pool scales")
+	})
+
+	t.Run("static agent that can't run the task does not net it out", func(t *testing.T) {
+		// A free macOS static agent cannot absorb a bare-linux task ⇒ counted.
+		macStatic := &woodpecker.Agent{
+			ID: 77, Name: "macmini", OrgID: -1, Capacity: 2,
+			CustomLabels: map[string]string{"type": "macos"},
+		}
+		autoscaler := Autoscaler{
+			client:    &MockClient{pending: []woodpecker.Task{linuxTask()}},
+			allAgents: []*woodpecker.Agent{macStatic},
+			config: &config.Config{
+				WorkflowsPerAgent: 1,
+				MaxAgents:         8,
+				PoolID:            "1",
+				ExtraAgentLabels:  elasticLabels(),
+			},
+		}
+
+		value, _ := autoscaler.calcAgents(t.Context())
+		assert.Equal(t, float64(1), value, "macOS static can't run linux ⇒ not netted")
+	})
 }
 
 func Test_getQueueInfo(t *testing.T) {
 	zerolog.SetGlobalLevel(zerolog.ErrorLevel)
-	t.Run("should not filter", func(t *testing.T) {
+	t.Run("returns the full queue info with task lists", func(t *testing.T) {
 		autoscaler := Autoscaler{
 			client: &MockClient{
-				pending: 2,
+				pending: []woodpecker.Task{linuxTask(), heavyTask()},
+				running: []woodpecker.Task{linuxTask()},
 			},
 			config: &config.Config{},
 		}
 
-		free, running, pending, _ := autoscaler.getQueueInfo(t.Context())
-		assert.Equal(t, 0, free)
-		assert.Equal(t, 0, running)
-		assert.Equal(t, 2, pending)
+		info, err := autoscaler.getQueueInfo(t.Context())
+		assert.NoError(t, err)
+		assert.Len(t, info.Pending, 2)
+		assert.Len(t, info.Running, 1)
 	})
 }
 
