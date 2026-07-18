@@ -12,7 +12,13 @@
 #
 # Requires (fork CI setup, Matt-steps): the fork enrolled on
 # ci.sealedsecurity.com and a `ghcr_token` secret (a PAT / GITHUB_TOKEN with
-# write:packages for ghcr.io/sealedsecurity) registered on the repo.
+# write:packages for ghcr.io/sealedsecurity) registered on the repo. The secret
+# MUST be registered restricted to the push and tag events only — never
+# pull_request — so a PR that adds a step referencing `from_secret: ghcr_token`
+# cannot read the credential. (Woodpecker's default already withholds secrets
+# from pull_request events; this makes the required posture explicit rather than
+# assumed.) Only sealed release tags (`*-sealed.*`) publish — the publish-tag
+# step is gated on that ref pattern, so a stray or upstream tag never pushes.
 
 when:
   - event: [pull_request, tag]
@@ -25,7 +31,7 @@ variables:
     buildkit_oci_max_parallelism: 1
     dockerfile: docker/Dockerfile
     repo: 'ghcr.io/sealedsecurity/autoscaler'
-    registry: 'https://ghcr.io'
+    registry: 'ghcr.io'
     platforms: 'linux/arm64/v8,linux/amd64'
   - &golang_image 'docker.io/golang:1.26'
 
@@ -66,3 +72,4 @@ steps:
         from_secret: ghcr_token
     when:
       event: tag
+      ref: 'refs/tags/*-sealed.*'
